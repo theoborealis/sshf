@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  BINARY: sshf
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: debian:bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y curl xz-utils git sudo
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Build
+        run: nix build --accept-flake-config
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.arch }}
+          path: result/bin/${{ env.BINARY }}
+
+  setup-keys:
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    steps:
+      - name: Generate test keys
+        run: |
+          apt-get update && apt-get install -y openssh-client
+          mkdir -p keys
+          ssh-keygen -t ed25519 -f keys/key1 -N "" -C "key1"
+          ssh-keygen -t ed25519 -f keys/key2 -N "" -C "key2"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-keys
+          path: keys/
+
+  test:
+    needs: [build, setup-keys]
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    strategy:
+      matrix:
+        test: [whitelist, blacklist, error-handling]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sshf-x86_64
+          path: bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-keys
+          path: keys/
+
+      - name: Setup
+        run: |
+          apt-get update && apt-get install -y openssh-client
+          chmod +x bin/*
+          chmod 600 keys/key1 keys/key2
+
+      - name: Test whitelist
+        if: matrix.test == 'whitelist'
+        run: |
+          set -e
+          eval $(ssh-agent -s)
+          ssh-add keys/key1
+          ssh-add keys/key2
+
+          bin/sshf --whitelist "key1" $SSH_AUTH_SOCK /tmp/filtered.sock &
+          sleep 1
+
+          # Only key1 visible
+          [ $(SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | wc -l) -eq 1 ]
+          SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | grep -q "key1"
+          ! SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | grep -q "key2"
+
+      - name: Test blacklist
+        if: matrix.test == 'blacklist'
+        run: |
+          set -e
+          eval $(ssh-agent -s)
+          ssh-add keys/key1
+          ssh-add keys/key2
+
+          bin/sshf --blacklist "key1" $SSH_AUTH_SOCK /tmp/filtered.sock &
+          sleep 1
+
+          # Only key2 visible (key1 blacklisted)
+          [ $(SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | wc -l) -eq 1 ]
+          SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | grep -q "key2"
+          ! SSH_AUTH_SOCK=/tmp/filtered.sock ssh-add -l | grep -q "key1"
+
+      - name: Test error handling
+        if: matrix.test == 'error-handling'
+        run: |
+          set -e
+
+          # Non-existent socket should fail gracefully
+          if bin/sshf --whitelist "test" /nonexistent.sock /tmp/out.sock 2>&1; then
+            echo "Should have failed on non-existent socket"
+            exit 1
+          fi
+
+          # Output socket already exists should fail
+          eval $(ssh-agent -s)
+          touch /tmp/existing.sock
+          if bin/sshf --whitelist "test" $SSH_AUTH_SOCK /tmp/existing.sock 2>&1; then
+            echo "Should have failed on existing output socket"
+            exit 1
+          fi
+          bin/sshf --whitelist "test" $SSH_AUTH_SOCK /tmp/existing.sock 2>&1 | grep -q "already exists"
+
+          # Empty agent should work (no crash)
+          bin/sshf --whitelist "test" $SSH_AUTH_SOCK /tmp/empty.sock &
+          sleep 1
+          # Should return "no identities" not crash
+          SSH_AUTH_SOCK=/tmp/empty.sock ssh-add -l 2>&1 | grep -q "no identities"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sshf-x86_64
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sshf-aarch64
+          path: dist/aarch64/
+
+      - name: Prepare assets
+        run: |
+          cd dist
+          mv sshf sshf-linux-amd64
+          mv aarch64/sshf sshf-linux-arm64
+          rm -rf aarch64
+          sha256sum sshf-* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
