@@ -24,6 +24,13 @@
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     in
     {
+      hmModule =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./hm-module.nix ];
+          services.sshf.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+
       packages = forAllSystems (
         system:
         let

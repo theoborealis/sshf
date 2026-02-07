@@ -25,7 +25,27 @@ cargo build --release
 # flake.nix inputs
 sshf.url = "github:theoborealis/sshf";
 sshf.inputs.nixpkgs.follows = "nixpkgs";
+```
 
-# home.nix
-home.packages = [ inputs.sshf.packages.${pkgs.system}.default ];
+```nix
+# home.nix - with systemd service
+{ inputs, ... }:
+{
+  imports = [ inputs.sshf.hmModule ];
+  services.sshf = {
+    enable = true;
+    mode = "whitelist";  # or "blacklist"
+    pattern = "work-*";
+    # inputSocket = "%t/ssh-agent";   # default
+    # outputSocket = "%t/sshf.sock";  # default
+  };
+}
+```
+
+```nix
+# home.nix - package only
+{ inputs, pkgs, ... }:
+{
+  home.packages = [ inputs.sshf.packages.${pkgs.system}.default ];
+}
 ```
